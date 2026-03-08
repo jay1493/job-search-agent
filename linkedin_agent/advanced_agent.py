@@ -8,9 +8,9 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langgraph.checkpoint.memory import MemorySaver
+from linkedin_agent.llm_factory import create_chat_model
 
 # ============================================================================
 # ENHANCED STATE WITH MEMORY
@@ -134,7 +134,7 @@ def supervisor_agent(state: EnhancedAgentState) -> EnhancedAgentState:
     Supervisor agent that routes to specialized agents.
     Decides which agent should handle the current task.
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = create_chat_model(temperature=0, max_tokens=1024)
     
     system_prompt = """
     You are a supervisor agent coordinating a team of specialized agents:
@@ -166,7 +166,7 @@ def researcher_agent(state: EnhancedAgentState) -> EnhancedAgentState:
     """
     Specialized agent for job search and research.
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = create_chat_model(temperature=0, max_tokens=2048)
     
     # Import tools from main agent file
     from linkedin_agent.agent import search_linkedin_jobs, get_job_details
@@ -195,7 +195,7 @@ def analyst_agent(state: EnhancedAgentState) -> EnhancedAgentState:
     """
     Specialized agent for analyzing job matches.
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = create_chat_model(temperature=0, max_tokens=2048)
     
     tools = [calculate_job_score]
     llm_with_tools = llm.bind_tools(tools)
@@ -221,7 +221,7 @@ def applicant_agent(state: EnhancedAgentState) -> EnhancedAgentState:
     """
     Specialized agent for job applications.
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = create_chat_model(temperature=0, max_tokens=2048)
     
     from linkedin_agent.agent import apply_to_job, generate_cover_letter
     
@@ -249,7 +249,7 @@ def tracker_agent(state: EnhancedAgentState) -> EnhancedAgentState:
     """
     Specialized agent for tracking applications.
     """
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm = create_chat_model(temperature=0, max_tokens=1024)
     
     system_prompt = """
     You are an application tracking specialist.

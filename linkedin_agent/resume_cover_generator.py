@@ -4,10 +4,9 @@ Generates tailored resumes and cover letters based on user profile and job descr
 """
 
 from typing import Dict, Optional
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage, HumanMessage
-import os
 from datetime import datetime
+from linkedin_agent.llm_factory import create_chat_model
 
 # ============================================================================
 # RESUME GENERATOR
@@ -18,11 +17,11 @@ class ResumeGenerator:
     Generates tailored resumes based on user profile and job requirements.
     """
     
-    def __init__(self, llm_model: str = "claude-sonnet-4-20250514"):
-        self.llm = ChatAnthropic(
-            model=llm_model,
+    def __init__(self, llm_model: Optional[str] = None):
+        self.llm = create_chat_model(
+            llm_model=llm_model,
             temperature=0.3,  # Slightly creative but consistent
-            max_tokens=4096
+            max_tokens=4096,
         )
     
     def generate_resume(
@@ -190,11 +189,11 @@ class CoverLetterGenerator:
     Generates personalized cover letters based on user profile and job.
     """
     
-    def __init__(self, llm_model: str = "claude-sonnet-4-20250514"):
-        self.llm = ChatAnthropic(
-            model=llm_model,
+    def __init__(self, llm_model: Optional[str] = None):
+        self.llm = create_chat_model(
+            llm_model=llm_model,
             temperature=0.4,  # More creative for cover letters
-            max_tokens=2048
+            max_tokens=2048,
         )
     
     def generate_cover_letter(

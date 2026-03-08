@@ -115,6 +115,40 @@ LANGCHAIN_API_KEY=your_langsmith_key_here
 LANGCHAIN_PROJECT=linkedin-job-agent
 ```
 
+### 5. Optional: Run With Local Models (Ollama)
+
+If you want to use local models instead of Anthropic:
+
+```bash
+# Start Ollama locally first
+ollama serve
+
+# Select provider + model for the agent
+export LLM_PROVIDER=ollama
+export LLM_MODEL=qwen2.5-coder:7b
+
+# Optional if Ollama runs on custom host/port
+export OLLAMA_BASE_URL=http://localhost:11434
+```
+
+You can also use:
+- `deepseek-coder:6.7b-instruct`
+- `llama3:latest`
+
+### 6. Optional: Google Search API Fallback For LinkedIn URLs
+
+The scraper now supports Google Custom Search API fallback in `auto` mode
+to discover LinkedIn job URLs when direct LinkedIn scraping returns limited results.
+
+```bash
+export LINKEDIN_SCRAPER_METHOD=auto
+export LINKEDIN_SEARCH_STRATEGY=auto
+export GOOGLE_SEARCH_API_KEY=your_google_api_key
+export GOOGLE_SEARCH_ENGINE_ID=your_custom_search_engine_id
+```
+
+Set `LINKEDIN_SEARCH_STRATEGY=google` to force Google-only discovery.
+
 ## 🚀 Running the Agent
 
 ### Option 1: Using LangGraph Studio (Recommended)

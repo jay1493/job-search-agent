@@ -8,9 +8,10 @@ from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_anthropic import ChatAnthropic
 from langchain_core.tools import tool
-import operator
+import os
+import json
+import re
 
 # ============================================================================
 # STATE DEFINITION
@@ -33,23 +34,97 @@ class AgentState(MessagesState):
 # ============================================================================
 
 # Import the real scraper and profile fetcher
-from linkedin_agent.real_linkedin_scraper import LinkedInJobScraper
+from linkedin_agent.real_linkedin_scraper import create_linkedin_scraper
 from linkedin_agent.profile_fetcher import get_user_profile
 from linkedin_agent.resume_cover_generator import (
     generate_resume_for_job,
     generate_cover_letter_for_job,
     generate_full_application
 )
+from linkedin_agent.llm_factory import create_chat_model
 
 # Initialize scraper globally
 _scraper = None
 _user_profile = None
 
+
+def _extract_json_object(text: str) -> dict | None:
+    """Best-effort extraction of a JSON object from model text output."""
+    if not text:
+        return None
+
+    # Try raw JSON first
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    # Try fenced code block JSON
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fenced:
+        try:
+            parsed = json.loads(fenced.group(1))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    # Try first {...} block
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = text[start:end + 1]
+        try:
+            parsed = json.loads(snippet)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    return None
+
+
+def _coerce_text_tool_call(response: AIMessage) -> AIMessage:
+    """
+    Convert plain-text JSON tool intent into a real tool_call for local models.
+    """
+    if hasattr(response, "tool_calls") and response.tool_calls:
+        return response
+
+    content = response.content if isinstance(response.content, str) else ""
+    payload = _extract_json_object(content)
+    if not payload:
+        return response
+
+    # Supported shapes:
+    # {"name": "tool_name", "arguments": {...}}
+    # {"tool": "tool_name", "args": {...}}
+    tool_name = payload.get("name") or payload.get("tool")
+    args = payload.get("arguments") or payload.get("args") or {}
+
+    if not tool_name or not isinstance(args, dict):
+        return response
+
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "id": "local_tool_call_1",
+                "name": tool_name,
+                "args": args,
+                "type": "tool_call",
+            }
+        ],
+    )
+
 def get_scraper():
     """Lazy initialization of scraper"""
     global _scraper
     if _scraper is None:
-        _scraper = LinkedInJobScraper()
+        method = os.getenv("LINKEDIN_SCRAPER_METHOD", "auto")
+        _scraper = create_linkedin_scraper(method=method)
     return _scraper
 
 def get_cached_user_profile():
@@ -418,11 +493,7 @@ def agent_node(state: AgentState) -> AgentState:
     messages = state["messages"]
     
     # Initialize the LLM with tools - Using Claude Sonnet 4
-    llm = ChatAnthropic(
-        model="claude-sonnet-4-20250514",
-        temperature=0,
-        max_tokens=4096
-    )
+    llm = create_chat_model(temperature=0, max_tokens=4096)
     tools = [
         search_linkedin_jobs,
         get_job_details,
@@ -434,8 +505,20 @@ def agent_node(state: AgentState) -> AgentState:
     ]
     llm_with_tools = llm.bind_tools(tools)
     
+    llm_provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
+    local_tool_call_instructions = ""
+    if llm_provider == "ollama":
+        local_tool_call_instructions = """
+    IMPORTANT TOOL-CALLING RULES (LOCAL MODEL):
+    - If a tool is needed, CALL the tool via the model's tool-calling interface.
+    - Do NOT return a JSON blob in normal text like {"name": "...", "arguments": {...}}.
+    - Do NOT describe a tool call. Actually perform the tool call.
+    - If user asks to search jobs, call search_linkedin_jobs immediately with concrete arguments.
+    - After tool results are returned, summarize results clearly for the user.
+    """
+
     # System message for the agent
-    system_message = SystemMessage(content="""
+    system_message = SystemMessage(content=f"""
     You are an intelligent LinkedIn job search and application assistant with access to the user's real LinkedIn profile.
     
     Your capabilities:
@@ -466,10 +549,12 @@ def agent_node(state: AgentState) -> AgentState:
     - Experience level
     - Job type (full-time, contract, etc.)
     - Remote options
+    {local_tool_call_instructions}
     """)
     
     # Invoke the LLM
     response = llm_with_tools.invoke([system_message] + messages)
+    response = _coerce_text_tool_call(response)
     
     return {"messages": [response]}
 

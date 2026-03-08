@@ -23,7 +23,10 @@ class LinkedInJobScraper:
     """
     
     def __init__(self):
-        self.base_url = "https://www.linkedin.com/jobs/search"
+        self.base_url = "https://in.linkedin.com/jobs/search"
+        self.see_more_url = "https://in.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+        self.typeahead_url = "https://in.linkedin.com/jobs-guest/api/typeaheadHits"
+        self.search_strategy = os.getenv("LINKEDIN_SEARCH_STRATEGY", "auto").strip().lower()
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -33,6 +36,57 @@ class LinkedInJobScraper:
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1'
         })
+
+    def _normalize_india_location(self, location: str) -> str:
+        """Append ', India' when location is provided without country suffix."""
+        if not location:
+            return location
+        loc = location.strip()
+        loc_lower = loc.lower()
+        if loc_lower.endswith(", india") or loc_lower == "india":
+            return loc
+        return f"{loc}, India"
+
+    def _resolve_india_geo_id(self, location: str) -> Optional[str]:
+        """
+        Resolve geoId via LinkedIn typeahead and keep only results ending with ', India'.
+        """
+        if not location:
+            return None
+
+        try:
+            response = self.session.get(
+                self.typeahead_url,
+                params={
+                    "query": location,
+                    "typeaheadType": "GEO",
+                    "geoTypes": "POPULATED_PLACE,ADMIN_DIVISION_2,MARKET_AREA,COUNTRY_REGION",
+                },
+                timeout=10,
+            )
+            response.raise_for_status()
+            hits = response.json()
+        except Exception as e:
+            print(f"Typeahead geo lookup failed: {e}")
+            return None
+
+        if not isinstance(hits, list):
+            return None
+
+        india_hits = [
+            item for item in hits
+            if str(item.get("displayName", "")).strip().endswith(", India")
+        ]
+        if not india_hits:
+            return None
+
+        location_lower = location.lower().strip()
+        for item in india_hits:
+            display = str(item.get("displayName", "")).lower()
+            if display.startswith(location_lower):
+                return str(item.get("id"))
+
+        return str(india_hits[0].get("id"))
     
     def search_jobs(
         self,
@@ -57,12 +111,30 @@ class LinkedInJobScraper:
         Returns:
             List of job dictionaries
         """
+        if self.search_strategy == "google":
+            return self._search_jobs_via_google(
+                keywords=keywords,
+                location=location,
+                experience_level=experience_level,
+                job_type=job_type,
+                remote=remote,
+                limit=limit,
+            )
+
+        location_with_country = self._normalize_india_location(location)
+        geo_id = self._resolve_india_geo_id(location)
+
         # Build search URL
         params = {
             'keywords': keywords,
-            'location': location,
+            'location': location_with_country,
+            'trk': 'public_jobs_jobs-search-bar_search-submit',
+            'position': 1,
+            'pageNum': 0,
             'start': 0
         }
+        if geo_id:
+            params['geoId'] = geo_id
         
         # Add filters
         filters = []
@@ -101,12 +173,21 @@ class LinkedInJobScraper:
         page = 0
         
         while len(jobs) < limit:
-            params['start'] = page * 25
+            if page == 0:
+                request_url = self.base_url
+                params['position'] = 1
+                params['pageNum'] = 0
+                params['start'] = 0
+            else:
+                request_url = self.see_more_url
+                params['position'] = page * 25
+                params['pageNum'] = page
+                params['start'] = page * 25
             
             try:
                 # Make request
                 response = self.session.get(
-                    self.base_url,
+                    request_url,
                     params=params,
                     timeout=10
                 )
@@ -150,6 +231,125 @@ class LinkedInJobScraper:
                 print(f"Error fetching jobs: {e}")
                 break
         
+        jobs = jobs[:limit]
+
+        # Auto mode: if LinkedIn page scrape did not return enough jobs,
+        # top up with Google Search API LinkedIn URLs (if configured).
+        if self.search_strategy == "auto" and len(jobs) < limit:
+            google_jobs = self._search_jobs_via_google(
+                keywords=keywords,
+                location=location_with_country,
+                experience_level=experience_level,
+                job_type=job_type,
+                remote=remote,
+                limit=limit,
+            )
+            if google_jobs:
+                existing_keys = {j.get("job_id") or j.get("url") for j in jobs}
+                for g_job in google_jobs:
+                    key = g_job.get("job_id") or g_job.get("url")
+                    if key in existing_keys:
+                        continue
+                    jobs.append(g_job)
+                    existing_keys.add(key)
+                    if len(jobs) >= limit:
+                        break
+
+        return jobs[:limit]
+
+    def _search_jobs_via_google(
+        self,
+        keywords: str,
+        location: str = "",
+        experience_level: str = "",
+        job_type: str = "",
+        remote: bool = False,
+        limit: int = 25,
+    ) -> List[Dict]:
+        """
+        Search LinkedIn job URLs through Google Custom Search JSON API.
+
+        Requires:
+        - GOOGLE_SEARCH_API_KEY
+        - GOOGLE_SEARCH_ENGINE_ID
+        """
+        api_key = os.getenv("GOOGLE_SEARCH_API_KEY")
+        cse_id = os.getenv("GOOGLE_SEARCH_ENGINE_ID")
+
+        if not api_key or not cse_id:
+            print("Google Search API not configured. Set GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID.")
+            return []
+
+        query_parts = [keywords, "LinkedIn jobs", "site:linkedin.com/jobs/view"]
+        if location:
+            query_parts.append(location)
+        if experience_level:
+            query_parts.append(f"{experience_level} experience")
+        if job_type:
+            query_parts.append(job_type)
+        if remote:
+            query_parts.append("remote")
+
+        query = " ".join(query_parts)
+        jobs = []
+        start_index = 1
+
+        while len(jobs) < limit:
+            per_page = min(10, limit - len(jobs))
+            params = {
+                "key": api_key,
+                "cx": cse_id,
+                "q": query,
+                "num": per_page,
+                "start": start_index,
+            }
+
+            try:
+                response = requests.get(
+                    "https://www.googleapis.com/customsearch/v1",
+                    params=params,
+                    timeout=10,
+                )
+                response.raise_for_status()
+                data = response.json()
+            except Exception as e:
+                print(f"Google Search API error: {e}")
+                break
+
+            items = data.get("items", [])
+            if not items:
+                break
+
+            for item in items:
+                url = item.get("link", "")
+                if "linkedin.com/jobs/view" not in url:
+                    continue
+
+                title = item.get("title", "LinkedIn Job")
+                snippet = item.get("snippet", "")
+                job_id = self._extract_job_id(url)
+
+                jobs.append({
+                    "job_id": job_id,
+                    "title": title.replace(" | LinkedIn", "").replace(" - LinkedIn", ""),
+                    "company": "Unknown",
+                    "location": location or "Not specified",
+                    "description": snippet,
+                    "url": url,
+                    "posted_date": "Unknown",
+                    "easy_apply": False,
+                    "source": "Google Search API",
+                    "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+
+                if len(jobs) >= limit:
+                    break
+
+            next_page = data.get("queries", {}).get("nextPage", [])
+            if not next_page:
+                break
+            start_index = next_page[0].get("startIndex", start_index + per_page)
+
         return jobs[:limit]
     
     def _parse_job_card(self, card) -> Optional[Dict]:
@@ -193,7 +393,7 @@ class LinkedInJobScraper:
                 'company': company,
                 'location': location,
                 'description': description,
-                'url': f"https://www.linkedin.com{job_link}" if job_link.startswith('/') else job_link,
+                'url': f"https://in.linkedin.com{job_link}" if job_link.startswith('/') else job_link,
                 'posted_date': posted_date,
                 'easy_apply': False,  # Can't determine from public page
                 'scraped_at': time.strftime('%Y-%m-%d %H:%M:%S')
@@ -218,7 +418,7 @@ class LinkedInJobScraper:
         Returns:
             Detailed job information
         """
-        url = f"https://www.linkedin.com/jobs/view/{job_id}"
+        url = f"https://in.linkedin.com/jobs/view/{job_id}"
         
         try:
             response = self.session.get(url, timeout=10)
@@ -480,18 +680,19 @@ def create_linkedin_scraper(method: str = "auto") -> object:
     elif method == "public":
         return LinkedInJobScraper()
     
-    else:  # auto
-        # Try methods in order of preference
+    else:  # auto or # google
+        # Use public scraper first because it supports Google API fallback
+        # and does not require extra credentials/dependencies.
         try:
-            print("Attempting to use linkedin-jobs-scraper library...")
-            return LinkedInJobsLibraryScraper()
+            print("Using public LinkedIn scraper with optional Google fallback...")
+            return LinkedInJobScraper()
         except:
             try:
+                print("Falling back to linkedin-jobs-scraper library...")
+                return LinkedInJobsLibraryScraper()
+            except:
                 print("Falling back to linkedin-api...")
                 return LinkedInAPIClient()
-            except:
-                print("Using public scraper (no authentication required)...")
-                return LinkedInJobScraper()
 
 
 # ============================================================================
