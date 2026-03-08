@@ -645,7 +645,7 @@ if __name__ == "__main__":
     # Test the agent with a sample query
     initial_state = {
         "messages": [
-            HumanMessage(content="Find me AI engineer jobs in San Francisco")
+            HumanMessage(content="Find me AI engineer jobs in Noida with remote options")
         ],
         "job_search_params": {},
         "found_jobs": [],
