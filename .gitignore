@@ -74,3 +74,6 @@ playwright-state/
 # Credentials (extra safety)
 credentials.json
 secrets.json
+envVars.claude.sh
+envVars.ollama.sh
+.claudeEnv/
