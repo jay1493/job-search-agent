@@ -3,15 +3,16 @@ LinkedIn Job Search and Application Agent
 Built with LangGraph for agentic AI workflows
 """
 
-from typing import Annotated, TypedDict, Literal
+from typing import Annotated, TypedDict, Literal, Optional
 from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 import os
 import json
 import re
+import ast
 
 # ============================================================================
 # STATE DEFINITION
@@ -56,6 +57,12 @@ def _extract_json_object(text: str) -> dict | None:
     # Try raw JSON first
     try:
         parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    try:
+        parsed = ast.literal_eval(text)
         if isinstance(parsed, dict):
             return parsed
     except Exception:
@@ -118,6 +125,399 @@ def _coerce_text_tool_call(response: AIMessage) -> AIMessage:
             }
         ],
     )
+
+
+def _latest_user_text(messages: list) -> str:
+    """Get latest user message text."""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            content = msg.content
+            if isinstance(content, str):
+                return content
+            return str(content)
+    return ""
+
+
+def _latest_human_index(messages: list) -> int:
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            return i
+    return -1
+
+
+def _has_tool_after_latest_human(messages: list) -> bool:
+    h_idx = _latest_human_index(messages)
+    if h_idx == -1:
+        return False
+    for i in range(h_idx + 1, len(messages)):
+        if isinstance(messages[i], ToolMessage):
+            return True
+    return False
+
+
+def _extract_numeric_job_id(text: str) -> Optional[str]:
+    """Extract numeric LinkedIn job id from plain id or full URL."""
+    url_match = re.search(r"/jobs/view/(?:[^/?]+-)?(\d+)", text)
+    if url_match:
+        return url_match.group(1)
+    id_match = re.search(r"\b(\d{6,})\b", text)
+    if id_match:
+        return id_match.group(1)
+    return None
+
+
+def _guess_experience_level(text: str) -> str:
+    t = text.lower()
+    if any(k in t for k in ["entry", "fresher", "junior", "0-1", "0 to 1", "1 year"]):
+        return "entry"
+    if any(k in t for k in ["senior", "lead", "staff", "principal", "5-7", "6 year", "7 year"]):
+        return "senior"
+    if "director" in t:
+        return "director"
+    if "executive" in t:
+        return "executive"
+    return "mid"
+
+
+def _guess_job_type(text: str) -> str:
+    t = text.lower()
+    if "part-time" in t or "part time" in t:
+        return "part-time"
+    if "contract" in t:
+        return "contract"
+    if "temporary" in t:
+        return "temporary"
+    if "intern" in t:
+        return "internship"
+    return "full-time"
+
+
+def _extract_search_keywords(text: str) -> str:
+    """Extract role/keyword phrase from a user request."""
+    t = text.strip()
+    role_match = re.search(r"([a-zA-Z0-9/+\-\s]{2,60})\s+jobs?", t, re.IGNORECASE)
+    if role_match:
+        role = role_match.group(1)
+        role = re.sub(r"^(find|search|show|list|get)\s+(me\s+)?", "", role, flags=re.IGNORECASE).strip()
+        return role or "software engineer"
+    return "software engineer"
+
+
+def _extract_location(text: str) -> str:
+    """Extract a probable location phrase from user request."""
+    loc_match = re.search(
+        r"\b(?:in|at|near)\s+([a-zA-Z][a-zA-Z\s\-/,]{1,60}?)(?:\s+(?:for|with|jobs?|role|position|remote)\b|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if not loc_match:
+        return ""
+    return loc_match.group(1).strip(" ,")
+
+
+def _latest_job_from_messages(messages: list) -> dict:
+    """
+    Best-effort extraction of most recent job object from tool outputs.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            continue
+        content = msg.content
+        payload = None
+        if isinstance(content, str):
+            payload = _extract_json_object(content)
+        elif isinstance(content, dict):
+            payload = content
+
+        if not isinstance(payload, dict):
+            continue
+
+        jobs = payload.get("jobs")
+        if isinstance(jobs, list) and jobs:
+            job = jobs[0]
+            if isinstance(job, dict):
+                return job
+    return {}
+
+
+def _latest_jobs_from_messages(messages: list) -> list[dict]:
+    """
+    Best-effort extraction of most recent jobs list from tool outputs.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            continue
+        content = msg.content
+        payload = None
+        if isinstance(content, str):
+            payload = _extract_json_object(content)
+        elif isinstance(content, dict):
+            payload = content
+
+        if not isinstance(payload, dict):
+            continue
+
+        jobs = payload.get("jobs")
+        if isinstance(jobs, list) and jobs:
+            return [j for j in jobs if isinstance(j, dict)]
+    return []
+
+
+def _extract_company_name(text: str) -> str:
+    patterns = [
+        r"\bat\s+([A-Za-z0-9&.,\- ]{2,60})",
+        r"\bfor\s+([A-Za-z0-9&.,\- ]{2,60})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            value = m.group(1).strip(" .,:")
+            if value:
+                return value
+    return ""
+
+
+def _extract_job_title(text: str) -> str:
+    m = re.search(r"for\s+(.+?)\s+role", text, re.IGNORECASE)
+    if m:
+        title = m.group(1).strip(" .,:")
+        if title:
+            return title
+    return _extract_search_keywords(text)
+
+
+def _resolve_job_id_from_text_or_recent_jobs(messages: list, text: str) -> Optional[str]:
+    """
+    Resolve job id from:
+    1) explicit numeric id / URL in user text
+    2) index reference (job 1, 2nd job, index 3)
+    3) title/company match from latest job list
+    """
+    # 1) direct numeric extraction
+    direct = _extract_numeric_job_id(text)
+    if direct:
+        return direct
+
+    jobs = _latest_jobs_from_messages(messages)
+    if not jobs:
+        return None
+
+    # 2) index-based references (1-based)
+    idx_match = re.search(r"\b(?:job|index|#)\s*(\d{1,2})\b", text, re.IGNORECASE)
+    if not idx_match:
+        idx_match = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)\s+job\b", text, re.IGNORECASE)
+    if idx_match:
+        idx = int(idx_match.group(1))
+        if 1 <= idx <= len(jobs):
+            raw_id = str(jobs[idx - 1].get("job_id", "")).strip()
+            return _extract_numeric_job_id(raw_id) or raw_id or None
+
+    # 3) title/company contains matching
+    t = text.lower()
+    best = None
+    best_score = 0
+    for job in jobs:
+        title = str(job.get("title", "")).lower()
+        company = str(job.get("company", "")).lower()
+        score = 0
+        if title and title in t:
+            score += 2
+        if company and company in t:
+            score += 2
+        # token overlap fallback
+        for token in re.findall(r"[a-z0-9]+", t):
+            if len(token) < 4:
+                continue
+            if token in title:
+                score += 1
+            if token in company:
+                score += 1
+        if score > best_score:
+            best = job
+            best_score = score
+
+    if best and best_score > 0:
+        raw_id = str(best.get("job_id", "")).strip()
+        return _extract_numeric_job_id(raw_id) or raw_id or None
+
+    return None
+
+
+def _build_tool_summary_from_latest_tool(messages: list) -> Optional[str]:
+    """
+    Build a deterministic natural-language summary from the latest tool output.
+    This avoids a second local LLM call that can stall on large tool payloads.
+    """
+    if not messages or not isinstance(messages[-1], ToolMessage):
+        return None
+
+    content = messages[-1].content
+    payload = None
+    if isinstance(content, str):
+        payload = _extract_json_object(content)
+    elif isinstance(content, dict):
+        payload = content
+
+    if not isinstance(payload, dict):
+        return None
+
+    # search_linkedin_jobs summary
+    jobs = payload.get("jobs")
+    if isinstance(jobs, list):
+        count = payload.get("count", len(jobs))
+        lines = [f"Found {count} jobs.", ""]
+        for i, job in enumerate(jobs[:5], start=1):
+            title = job.get("title", "Unknown role")
+            company = job.get("company", "Unknown company")
+            location = job.get("location", "Unknown location")
+            raw_id = str(job.get("job_id", ""))
+            numeric_id = _extract_numeric_job_id(raw_id) or raw_id
+            lines.append(f"{i}. {title} at {company} ({location}) [job_id: {numeric_id}]")
+        lines.append("")
+        lines.append("You can ask:")
+        lines.append("- Get details for job 1")
+        lines.append("- Get details for job id <id>")
+        lines.append("- Show 20 more jobs")
+        return "\n".join(lines)
+
+    # get_job_details summary
+    if "full_description" in payload or "criteria" in payload:
+        job_id = payload.get("job_id", "unknown")
+        desc = str(payload.get("full_description", "")).strip()
+        excerpt = (desc[:700] + "...") if len(desc) > 700 else desc
+        criteria = payload.get("criteria", {})
+        criteria_text = ""
+        if isinstance(criteria, dict) and criteria:
+            preview = []
+            for k, v in list(criteria.items())[:5]:
+                preview.append(f"- {k}: {v}")
+            criteria_text = "\n".join(preview)
+        parts = [f"Fetched details for job_id {job_id}."]
+        if excerpt:
+            parts.extend(["", "Job description excerpt:", excerpt])
+        if criteria_text:
+            parts.extend(["", "Key criteria:", criteria_text])
+        parts.extend(["", "You can ask me to generate a resume, cover letter, or full application package for this role."])
+        return "\n".join(parts)
+
+    return None
+
+
+def _build_local_intent_tool_call(messages: list) -> Optional[AIMessage]:
+    """
+    Deterministic local router for frequent intents when local LLMs miss tool routing.
+    """
+    user_text = _latest_user_text(messages)
+    if not user_text:
+        return None
+
+    lower = user_text.lower()
+
+    # 1) Job details intent
+    if any(k in lower for k in ["job detail", "details", "description", "full description"]):
+        job_id = _resolve_job_id_from_text_or_recent_jobs(messages, user_text)
+        if job_id:
+            return AIMessage(
+                content="",
+                tool_calls=[{
+                    "id": "local_intent_get_job_details",
+                    "name": "get_job_details",
+                    "args": {"job_id": job_id},
+                    "type": "tool_call",
+                }],
+            )
+
+    # 2) Profile intent
+    if any(k in lower for k in ["my profile", "my linkedin profile", "show profile", "get profile"]):
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "id": "local_intent_get_profile",
+                "name": "get_my_profile",
+                "args": {},
+                "type": "tool_call",
+            }],
+        )
+
+    # 3) Search jobs intent
+    if "job" in lower and any(k in lower for k in ["find", "search", "show", "list", "more"]):
+        args = {
+            "keywords": _extract_search_keywords(user_text),
+            "location": _extract_location(user_text),
+            "experience_level": _guess_experience_level(user_text),
+            "job_type": _guess_job_type(user_text),
+            "remote": "remote" in lower,
+            "limit": 25 if "more" in lower else 10,
+        }
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "id": "local_intent_search_jobs",
+                "name": "search_linkedin_jobs",
+                "args": args,
+                "type": "tool_call",
+                }],
+        )
+
+    # 4) Full application package intent
+    if any(k in lower for k in ["application package", "full application", "resume and cover", "resume + cover"]):
+        latest_job = _latest_job_from_messages(messages)
+        args = {
+            "job_title": _extract_job_title(user_text) or latest_job.get("title", "Software Engineer"),
+            "company_name": _extract_company_name(user_text) or latest_job.get("company", "Target Company"),
+            "job_description": "Use job details from previous context. If missing, fetch details first.",
+            "save_files": True,
+        }
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "id": "local_intent_generate_package",
+                "name": "generate_application_package",
+                "args": args,
+                "type": "tool_call",
+            }],
+        )
+
+    # 5) Cover letter intent
+    if "cover letter" in lower:
+        latest_job = _latest_job_from_messages(messages)
+        args = {
+            "job_title": _extract_job_title(user_text) or latest_job.get("title", "Software Engineer"),
+            "company_name": _extract_company_name(user_text) or latest_job.get("company", "Target Company"),
+            "job_description": "Use job details from previous context. If missing, fetch details first.",
+        }
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "id": "local_intent_generate_cover_letter",
+                "name": "generate_cover_letter",
+                "args": args,
+                "type": "tool_call",
+            }],
+        )
+
+    # 6) Resume intent
+    if "resume" in lower and "cover letter" not in lower:
+        format_choice = "professional"
+        if "ats" in lower:
+            format_choice = "ats"
+        elif "technical" in lower:
+            format_choice = "technical"
+
+        return AIMessage(
+            content="",
+            tool_calls=[{
+                "id": "local_intent_generate_resume",
+                "name": "generate_resume",
+                "args": {
+                    "job_description": "Use job details from previous context. If missing, fetch details first.",
+                    "format": format_choice,
+                },
+                "type": "tool_call",
+            }],
+        )
+
+    return None
 
 def get_scraper():
     """Lazy initialization of scraper"""
@@ -491,6 +891,33 @@ def agent_node(state: AgentState) -> AgentState:
     Uses the LLM to determine next steps based on conversation.
     """
     messages = state["messages"]
+    llm_provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
+
+    # Local models sometimes miss structured tool routing; use deterministic intent fallback.
+    if llm_provider == "ollama":
+        # If tools already ran for the latest user request, force a final summary step
+        # without tool binding to prevent re-calling the same tools in a loop.
+        if messages and isinstance(messages[-1], ToolMessage):
+            deterministic_summary = _build_tool_summary_from_latest_tool(messages)
+            if deterministic_summary:
+                return {"messages": [AIMessage(content=deterministic_summary)]}
+
+            summarizer = create_chat_model(temperature=0, max_tokens=2048)
+            no_tool_system = SystemMessage(content="""
+            You are a LinkedIn job assistant.
+            The latest tool result is already available in conversation.
+            Summarize the result clearly for the user and suggest concise next actions.
+            Do NOT call tools in this response.
+            """)
+            summary_response = summarizer.invoke([no_tool_system] + messages)
+            return {"messages": [summary_response]}
+
+        # Deterministic intent routing should only happen on fresh user input,
+        # not after tool outputs for the same turn.
+        if not _has_tool_after_latest_human(messages):
+            routed_tool_call = _build_local_intent_tool_call(messages)
+            if routed_tool_call is not None:
+                return {"messages": [routed_tool_call]}
     
     # Initialize the LLM with tools - Using Claude Sonnet 4
     llm = create_chat_model(temperature=0, max_tokens=4096)
@@ -505,7 +932,6 @@ def agent_node(state: AgentState) -> AgentState:
     ]
     llm_with_tools = llm.bind_tools(tools)
     
-    llm_provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
     local_tool_call_instructions = ""
     if llm_provider == "ollama":
         local_tool_call_instructions = """

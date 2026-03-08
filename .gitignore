@@ -77,3 +77,4 @@ secrets.json
 envVars.claude.sh
 envVars.ollama.sh
 .claudeEnv/
+.localQwenEnv/

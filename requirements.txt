@@ -25,8 +25,8 @@ linkedin-api>=2.3.1
 
 # Optional: More robust scraping (Method 2)
 # Uncomment if you want to use linkedin-jobs-scraper
-# linkedin-jobs-scraper>=1.15.0
-# selenium>=4.15.0
+linkedin-jobs-scraper>=1.15.0
+selenium>=4.15.0
 
 # HTTP and async
 httpx>=0.25.0
