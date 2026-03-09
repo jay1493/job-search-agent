@@ -484,7 +484,8 @@ def _build_tool_summary_from_latest_tool(messages: list) -> Optional[str]:
         lines.append("You can ask:")
         lines.append("- Get details for Linked-In job 1")
         lines.append("- Show 20 more jobs")
-        lines.append("- Generate resume and cover letter for a chosen role")
+        # Disabled for now:
+        # lines.append("- Generate resume and cover letter for a chosen role")
         return "\n".join(lines)
 
     # get_job_details summary
@@ -504,7 +505,7 @@ def _build_tool_summary_from_latest_tool(messages: list) -> Optional[str]:
             parts.extend(["", "Job description excerpt:", excerpt])
         if criteria_text:
             parts.extend(["", "Key criteria:", criteria_text])
-        parts.extend(["", "You can ask me to generate a resume, cover letter, or full application package for this role."])
+        parts.extend(["", "You can ask me to show more jobs or fetch details for another role."])
         return "\n".join(parts)
 
     return None
@@ -534,55 +535,56 @@ def _build_local_intent_tool_call(messages: list) -> Optional[AIMessage]:
                 }],
             )
 
+    # Disabled intent routes (kept as comments for quick restore):
     # 2) Profile intent
-    if any(k in lower for k in ["my profile", "my linkedin profile", "show profile", "get profile"]):
-        return AIMessage(
-            content="",
-            tool_calls=[{
-                "id": "local_intent_get_profile",
-                "name": "get_my_profile",
-                "args": {},
-                "type": "tool_call",
-            }],
-        )
-
+    # if any(k in lower for k in ["my profile", "my linkedin profile", "show profile", "get profile"]):
+    #     return AIMessage(
+    #         content="",
+    #         tool_calls=[{
+    #             "id": "local_intent_get_profile",
+    #             "name": "get_my_profile",
+    #             "args": {},
+    #             "type": "tool_call",
+    #         }],
+    #     )
+    #
     # 3) Full application package intent
-    if any(k in lower for k in ["application package", "full application", "resume and cover", "resume + cover"]):
-        latest_job = _latest_job_from_messages(messages)
-        args = {
-            "job_title": _extract_job_title(user_text) or latest_job.get("title", "Software Engineer"),
-            "company_name": _extract_company_name(user_text) or latest_job.get("company", "Target Company"),
-            "job_description": "Use job details from previous context. If missing, fetch details first.",
-            "save_files": True,
-        }
-        return AIMessage(
-            content="",
-            tool_calls=[{
-                "id": "local_intent_generate_package",
-                "name": "generate_application_package",
-                "args": args,
-                "type": "tool_call",
-            }],
-        )
-
+    # if any(k in lower for k in ["application package", "full application", "resume and cover", "resume + cover"]):
+    #     latest_job = _latest_job_from_messages(messages)
+    #     args = {
+    #         "job_title": _extract_job_title(user_text) or latest_job.get("title", "Software Engineer"),
+    #         "company_name": _extract_company_name(user_text) or latest_job.get("company", "Target Company"),
+    #         "job_description": "Use job details from previous context. If missing, fetch details first.",
+    #         "save_files": True,
+    #     }
+    #     return AIMessage(
+    #         content="",
+    #         tool_calls=[{
+    #             "id": "local_intent_generate_package",
+    #             "name": "generate_application_package",
+    #             "args": args,
+    #             "type": "tool_call",
+    #         }],
+    #     )
+    #
     # 4) Cover letter intent
-    if "cover letter" in lower:
-        latest_job = _latest_job_from_messages(messages)
-        args = {
-            "job_title": _extract_job_title(user_text) or latest_job.get("title", "Software Engineer"),
-            "company_name": _extract_company_name(user_text) or latest_job.get("company", "Target Company"),
-            "job_description": "Use job details from previous context. If missing, fetch details first.",
-        }
-        return AIMessage(
-            content="",
-            tool_calls=[{
-                "id": "local_intent_generate_cover_letter",
-                "name": "generate_cover_letter",
-                "args": args,
-                "type": "tool_call",
-            }],
-        )
-
+    # if "cover letter" in lower:
+    #     latest_job = _latest_job_from_messages(messages)
+    #     args = {
+    #         "job_title": _extract_job_title(user_text) or latest_job.get("title", "Software Engineer"),
+    #         "company_name": _extract_company_name(user_text) or latest_job.get("company", "Target Company"),
+    #         "job_description": "Use job details from previous context. If missing, fetch details first.",
+    #     }
+    #     return AIMessage(
+    #         content="",
+    #         tool_calls=[{
+    #             "id": "local_intent_generate_cover_letter",
+    #             "name": "generate_cover_letter",
+    #             "args": args,
+    #             "type": "tool_call",
+    #         }],
+    #     )
+    #
     # 5) Resume intent
     if "resume" in lower and "cover letter" not in lower:
         format_choice = "professional"
@@ -1171,11 +1173,12 @@ def agent_node(state: AgentState) -> AgentState:
     tools = [
         search_linkedin_jobs,
         get_job_details,
-        apply_to_job,
-        generate_cover_letter,
         generate_resume,
-        generate_application_package,
-        get_my_profile
+        # Disabled for now (re-enable later if needed):
+        # apply_to_job,
+        # generate_cover_letter,
+        # generate_application_package,
+        # get_my_profile,
     ]
     llm_with_tools = llm.bind_tools(tools)
     
@@ -1207,29 +1210,21 @@ def agent_node(state: AgentState) -> AgentState:
 
     # System message for the agent
     system_message = SystemMessage(content=f"""
-    You are an intelligent LinkedIn job search and application assistant with access to the user's real LinkedIn profile.
+    You are an intelligent LinkedIn job search assistant.
     
     Your capabilities:
     1. Search for real jobs on LinkedIn based on user criteria
     2. Get detailed information about specific jobs
-    3. Access the user's actual LinkedIn profile (skills, experience, education)
-    4. Generate personalized cover letters based on user's profile and job requirements
-    5. Generate tailored resumes optimized for specific jobs
-    6. Create complete application packages (resume + cover letter)
-    7. Apply to jobs on behalf of the user (with confirmation)
-    
-    When helping with applications:
-    - Always use get_my_profile first to understand the user's background
-    - Generate materials that highlight relevant experience from their actual profile
-    - Ask for confirmation before applying to jobs
-    - Save application materials to files when requested
+    3. Generate a tailored resume when the user explicitly asks for it
     
     Always:
-    - Ask for confirmation before applying to jobs
     - Provide clear summaries of job matches
     - Help users refine their search criteria
     - Be proactive in suggesting relevant actions
-    - Use the user's actual profile data for personalization
+    - Keep suggestions limited to:
+      - Get job details
+      - Show more jobs
+    - Do not proactively suggest cover letter, profile fetch, or application package actions
     - If tool output includes one or more aggregator lists like *_jobs, present each source in a separate section.
     {aggregator_instructions}
     
@@ -1282,11 +1277,12 @@ def create_linkedin_agent() -> StateGraph:
     tools = [
         search_linkedin_jobs,
         get_job_details,
-        apply_to_job,
-        generate_cover_letter,
         generate_resume,
-        generate_application_package,
-        get_my_profile
+        # Disabled for now (re-enable later if needed):
+        # apply_to_job,
+        # generate_cover_letter,
+        # generate_application_package,
+        # get_my_profile,
     ]
     workflow.add_node("tools", ToolNode(tools))
     
