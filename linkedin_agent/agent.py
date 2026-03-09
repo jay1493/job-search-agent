@@ -49,6 +49,10 @@ _scraper = None
 _user_profile = None
 
 
+def _env_true(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _extract_json_object(text: str) -> dict | None:
     """Best-effort extraction of a JSON object from model text output."""
     if not text:
@@ -233,6 +237,8 @@ def _latest_job_from_messages(messages: list) -> dict:
             continue
 
         jobs = payload.get("jobs")
+        if not isinstance(jobs, list):
+            jobs = payload.get("linkedin_jobs")
         if isinstance(jobs, list) and jobs:
             job = jobs[0]
             if isinstance(job, dict):
@@ -258,9 +264,48 @@ def _latest_jobs_from_messages(messages: list) -> list[dict]:
             continue
 
         jobs = payload.get("jobs")
+        if not isinstance(jobs, list):
+            jobs = payload.get("linkedin_jobs")
         if isinstance(jobs, list) and jobs:
             return [j for j in jobs if isinstance(j, dict)]
     return []
+
+
+def _latest_search_params_from_messages(messages: list) -> dict:
+    """
+    Extract latest search_params dict from tool outputs.
+    """
+    for msg in reversed(messages):
+        if not isinstance(msg, ToolMessage):
+            continue
+        content = msg.content
+        payload = None
+        if isinstance(content, str):
+            payload = _extract_json_object(content)
+        elif isinstance(content, dict):
+            payload = content
+
+        if not isinstance(payload, dict):
+            continue
+        params = payload.get("search_params")
+        if isinstance(params, dict):
+            return params
+    return {}
+
+
+def _extract_requested_sources(text: str) -> str:
+    """
+    Parse source filters from user text and return CSV suitable for tool args.
+    """
+    t = text.lower()
+    sources = []
+    if "linkedin" in t or "linked-in" in t or "linked in" in t:
+        sources.append("linkedin")
+    if "indeed" in t:
+        sources.append("indeed")
+    if "naukri" in t:
+        sources.append("naukri")
+    return ",".join(sources)
 
 
 def _extract_company_name(text: str) -> str:
@@ -361,23 +406,85 @@ def _build_tool_summary_from_latest_tool(messages: list) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
 
-    # search_linkedin_jobs summary
+    # search_linkedin_jobs summary with dynamic aggregator sections (*_jobs)
+    aggregator_sections: dict[str, list] = {}
+    for key, value in payload.items():
+        if key.endswith("_jobs") and isinstance(value, list):
+            aggregator_name = key[:-5].strip().lower()
+            aggregator_sections[aggregator_name] = value
+
     jobs = payload.get("jobs")
-    if isinstance(jobs, list):
-        count = payload.get("count", len(jobs))
-        lines = [f"Found {count} jobs.", ""]
-        for i, job in enumerate(jobs[:5], start=1):
-            title = job.get("title", "Unknown role")
-            company = job.get("company", "Unknown company")
-            location = job.get("location", "Unknown location")
-            raw_id = str(job.get("job_id", ""))
-            numeric_id = _extract_numeric_job_id(raw_id) or raw_id
-            lines.append(f"{i}. {title} at {company} ({location}) [job_id: {numeric_id}]")
-        lines.append("")
+    if aggregator_sections or isinstance(jobs, list):
+        display_name_map = {
+            "linkedin": "Linked-In",
+            "indeed": "Indeed",
+        }
+
+        lines = []
+        if aggregator_sections:
+            total_count = payload.get("count", sum(len(v) for v in aggregator_sections.values()))
+            lines.append(f"Found {total_count} jobs total.")
+            lines.append("")
+
+            ordered_sources = []
+            if "linkedin" in aggregator_sections:
+                ordered_sources.append("linkedin")
+            for src in sorted(aggregator_sections.keys()):
+                if src != "linkedin":
+                    ordered_sources.append(src)
+
+            for source in ordered_sources:
+                src_jobs = aggregator_sections.get(source, [])
+                if not isinstance(src_jobs, list):
+                    continue
+
+                display = display_name_map.get(source, source.replace("_", " ").title())
+                lines.append(f"{display} Jobs:")
+                if not src_jobs:
+                    lines.append("No jobs found.")
+                    lines.append("")
+                    continue
+                for i, job in enumerate(src_jobs[:5], start=1):
+                    title = job.get("title", "Unknown role")
+                    company = job.get("company", "Unknown company")
+                    location = job.get("location", "Unknown location")
+                    raw_id = str(job.get("job_id", ""))
+                    if source == "indeed":
+                        description = str(job.get("description", "")).strip()
+                        if len(description) > 240:
+                            description = f"{description[:237]}..."
+                        url = str(job.get("url", "")).strip() or "Not available"
+                        id_value = raw_id
+                        lines.append(f"{i}. {title} [{source}_id: {id_value}]")
+                        if description:
+                            lines.append(f"   Description: {description}")
+                        lines.append(f"   URL: {url}")
+                    elif source == "linkedin":
+                        id_value = _extract_numeric_job_id(raw_id) or raw_id
+                        id_label = "job_id"
+                        lines.append(f"{i}. {title} at {company} ({location}) [{id_label}: {id_value}]")
+                    else:
+                        id_value = raw_id
+                        id_label = f"{source}_id"
+                        lines.append(f"{i}. {title} at {company} ({location}) [{id_label}: {id_value}]")
+                lines.append("")
+        else:
+            count = payload.get("count", len(jobs))
+            lines.append(f"Found {count} jobs.")
+            lines.append("")
+            for i, job in enumerate(jobs[:5], start=1):
+                title = job.get("title", "Unknown role")
+                company = job.get("company", "Unknown company")
+                location = job.get("location", "Unknown location")
+                raw_id = str(job.get("job_id", ""))
+                numeric_id = _extract_numeric_job_id(raw_id) or raw_id
+                lines.append(f"{i}. {title} at {company} ({location}) [job_id: {numeric_id}]")
+            lines.append("")
+
         lines.append("You can ask:")
-        lines.append("- Get details for job 1")
-        lines.append("- Get details for job id <id>")
+        lines.append("- Get details for Linked-In job 1")
         lines.append("- Show 20 more jobs")
+        lines.append("- Generate resume and cover letter for a chosen role")
         return "\n".join(lines)
 
     # get_job_details summary
@@ -439,27 +546,7 @@ def _build_local_intent_tool_call(messages: list) -> Optional[AIMessage]:
             }],
         )
 
-    # 3) Search jobs intent
-    if "job" in lower and any(k in lower for k in ["find", "search", "show", "list", "more"]):
-        args = {
-            "keywords": _extract_search_keywords(user_text),
-            "location": _extract_location(user_text),
-            "experience_level": _guess_experience_level(user_text),
-            "job_type": _guess_job_type(user_text),
-            "remote": "remote" in lower,
-            "limit": 25 if "more" in lower else 10,
-        }
-        return AIMessage(
-            content="",
-            tool_calls=[{
-                "id": "local_intent_search_jobs",
-                "name": "search_linkedin_jobs",
-                "args": args,
-                "type": "tool_call",
-                }],
-        )
-
-    # 4) Full application package intent
+    # 3) Full application package intent
     if any(k in lower for k in ["application package", "full application", "resume and cover", "resume + cover"]):
         latest_job = _latest_job_from_messages(messages)
         args = {
@@ -478,7 +565,7 @@ def _build_local_intent_tool_call(messages: list) -> Optional[AIMessage]:
             }],
         )
 
-    # 5) Cover letter intent
+    # 4) Cover letter intent
     if "cover letter" in lower:
         latest_job = _latest_job_from_messages(messages)
         args = {
@@ -496,7 +583,7 @@ def _build_local_intent_tool_call(messages: list) -> Optional[AIMessage]:
             }],
         )
 
-    # 6) Resume intent
+    # 5) Resume intent
     if "resume" in lower and "cover letter" not in lower:
         format_choice = "professional"
         if "ats" in lower:
@@ -518,6 +605,62 @@ def _build_local_intent_tool_call(messages: list) -> Optional[AIMessage]:
         )
 
     return None
+
+
+def _build_search_intent_tool_call(messages: list) -> Optional[AIMessage]:
+    """
+    Cross-provider deterministic search routing.
+    If user asks to search/list/show jobs, force search_linkedin_jobs tool call.
+    """
+    user_text = _latest_user_text(messages)
+    if not user_text:
+        return None
+    lower = user_text.lower()
+
+    if "job" not in lower:
+        return None
+    if not any(k in lower for k in ["find", "search", "show", "list", "more"]):
+        return None
+
+    prev = _latest_search_params_from_messages(messages)
+    source_filter = _extract_requested_sources(user_text)
+    is_more = "more" in lower
+
+    if is_more and prev:
+        keywords = prev.get("keywords", "") or _extract_search_keywords(user_text)
+        location = prev.get("location", "") or _extract_location(user_text)
+        experience_level = prev.get("experience_level", "mid")
+        job_type = prev.get("job_type", "full-time")
+        remote = bool(prev.get("remote", False))
+    else:
+        keywords = _extract_search_keywords(user_text)
+        location = _extract_location(user_text) or prev.get("location", "")
+        experience_level = _guess_experience_level(user_text) if user_text else prev.get("experience_level", "mid")
+        job_type = _guess_job_type(user_text) if user_text else prev.get("job_type", "full-time")
+        remote = "remote" in lower or bool(prev.get("remote", False))
+
+    # Keep tool arguments concrete.
+    if not keywords:
+        keywords = prev.get("keywords", "software engineer")
+
+    args = {
+        "keywords": keywords,
+        "location": location,
+        "experience_level": experience_level,
+        "job_type": job_type,
+        "remote": remote,
+        "limit": 25 if is_more else 10,
+        "sources": source_filter,
+    }
+    return AIMessage(
+        content="",
+        tool_calls=[{
+            "id": "deterministic_search_jobs",
+            "name": "search_linkedin_jobs",
+            "args": args,
+            "type": "tool_call",
+        }],
+    )
 
 def get_scraper():
     """Lazy initialization of scraper"""
@@ -546,7 +689,8 @@ def search_linkedin_jobs(
     experience_level: str = "mid",
     job_type: str = "full-time",
     remote: bool = False,
-    limit: int = 10
+    limit: int = 10,
+    sources: str = ""
 ) -> dict:
     """
     Search for REAL jobs on LinkedIn based on criteria.
@@ -559,6 +703,8 @@ def search_linkedin_jobs(
         job_type: Type of job (full-time, part-time, contract, temporary, internship)
         remote: Filter for remote jobs only
         limit: Maximum number of jobs to return (default 10)
+        sources: Optional CSV source filter when aggregator is enabled.
+                 Example: "linkedin", "linkedin,naukri", "indeed,naukri"
     
     Returns:
         Dictionary containing list of real jobs found
@@ -566,29 +712,123 @@ def search_linkedin_jobs(
     try:
         scraper = get_scraper()
         
-        # Search for real jobs
-        jobs = scraper.search_jobs(
-            keywords=keywords,
-            location=location,
-            experience_level=experience_level,
-            job_type=job_type,
-            remote=remote,
-            limit=limit
-        )
-        
-        return {
+        search_aggregator = _env_true("SEARCH_AGGREGATOR")
+        requested_sources = {
+            s.strip().lower()
+            for s in (sources or "").split(",")
+            if s.strip()
+        }
+        if requested_sources:
+            requested_sources = {
+                "linkedin" if s in {"linked-in", "linked in"} else s
+                for s in requested_sources
+            }
+
+        include_linkedin = (not search_aggregator) or (not requested_sources) or ("linkedin" in requested_sources)
+        include_indeed = search_aggregator and ((not requested_sources) or ("indeed" in requested_sources))
+        include_naukri = search_aggregator and ((not requested_sources) or ("naukri" in requested_sources))
+        source_filter_fallback = False
+
+        linkedin_jobs = []
+        if include_linkedin:
+            linkedin_jobs = scraper.search_jobs(
+                keywords=keywords,
+                location=location,
+                experience_level=experience_level,
+                job_type=job_type,
+                remote=remote,
+                limit=limit
+            )
+
+        indeed_jobs = []
+        naukri_jobs = []
+        if include_indeed and hasattr(scraper, "search_indeed_jobs"):
+            indeed_jobs = scraper.search_indeed_jobs(
+                keywords=keywords,
+                location=location,
+                experience_level=experience_level,
+                limit=limit,
+            )
+        if include_naukri and hasattr(scraper, "search_naukri_jobs"):
+            naukri_jobs = scraper.search_naukri_jobs(
+                keywords=keywords,
+                location=location,
+                experience_level=experience_level,
+                limit=limit,
+            )
+
+        combined_jobs = linkedin_jobs + indeed_jobs + naukri_jobs
+
+        # If user explicitly requested one/more sources but no jobs came back,
+        # fallback to all aggregators.
+        if search_aggregator and requested_sources and not combined_jobs:
+            source_filter_fallback = True
+            include_linkedin = True
+            include_indeed = True
+            include_naukri = True
+
+            linkedin_jobs = scraper.search_jobs(
+                keywords=keywords,
+                location=location,
+                experience_level=experience_level,
+                job_type=job_type,
+                remote=remote,
+                limit=limit
+            )
+            indeed_jobs = scraper.search_indeed_jobs(
+                keywords=keywords,
+                location=location,
+                experience_level=experience_level,
+                limit=limit,
+            ) if hasattr(scraper, "search_indeed_jobs") else []
+            naukri_jobs = scraper.search_naukri_jobs(
+                keywords=keywords,
+                location=location,
+                experience_level=experience_level,
+                limit=limit,
+            ) if hasattr(scraper, "search_naukri_jobs") else []
+            combined_jobs = linkedin_jobs + indeed_jobs + naukri_jobs
+
+        result = {
             "success": True,
-            "jobs": jobs,
-            "count": len(jobs),
+            "jobs": combined_jobs if search_aggregator else linkedin_jobs,
+            "count": len(combined_jobs) if search_aggregator else len(linkedin_jobs),
             "search_params": {
                 "keywords": keywords,
                 "location": location,
                 "experience_level": experience_level,
                 "job_type": job_type,
-                "remote": remote
+                "remote": remote,
+                "sources": sources,
             },
-            "source": "LinkedIn (live scraping)"
+            "source": "LinkedIn (live scraping)" if not search_aggregator else "LinkedIn + Indeed + Naukri (aggregated)"
         }
+
+        if search_aggregator:
+            counts = {}
+            if include_linkedin:
+                result["linkedin_jobs"] = linkedin_jobs
+                counts["linkedin"] = len(linkedin_jobs)
+            if include_indeed:
+                result["indeed_jobs"] = indeed_jobs
+                counts["indeed"] = len(indeed_jobs)
+            if include_naukri:
+                result["naukri_jobs"] = naukri_jobs
+                counts["naukri"] = len(naukri_jobs)
+
+            result["counts"] = counts
+            result["aggregated"] = True
+            result["aggregator_debug"] = getattr(scraper, "last_aggregator_debug", {})
+            result["selected_sources"] = sorted(
+                [src for src, ok in {
+                    "linkedin": include_linkedin,
+                    "indeed": include_indeed,
+                    "naukri": include_naukri,
+                }.items() if ok]
+            )
+            result["source_filter_fallback"] = source_filter_fallback
+
+        return result
     
     except Exception as e:
         return {
@@ -892,16 +1132,20 @@ def agent_node(state: AgentState) -> AgentState:
     """
     messages = state["messages"]
     llm_provider = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
+    search_aggregator_enabled = _env_true("SEARCH_AGGREGATOR")
+
+    # Deterministic post-tool summary for all providers to keep output stable
+    # and ensure aggregator sections are properly separated.
+    if llm_provider == "ollama" and messages and isinstance(messages[-1], ToolMessage):
+        deterministic_summary = _build_tool_summary_from_latest_tool(messages)
+        if deterministic_summary:
+            return {"messages": [AIMessage(content=deterministic_summary)]}
 
     # Local models sometimes miss structured tool routing; use deterministic intent fallback.
     if llm_provider == "ollama":
         # If tools already ran for the latest user request, force a final summary step
         # without tool binding to prevent re-calling the same tools in a loop.
         if messages and isinstance(messages[-1], ToolMessage):
-            deterministic_summary = _build_tool_summary_from_latest_tool(messages)
-            if deterministic_summary:
-                return {"messages": [AIMessage(content=deterministic_summary)]}
-
             summarizer = create_chat_model(temperature=0, max_tokens=2048)
             no_tool_system = SystemMessage(content="""
             You are a LinkedIn job assistant.
@@ -915,6 +1159,9 @@ def agent_node(state: AgentState) -> AgentState:
         # Deterministic intent routing should only happen on fresh user input,
         # not after tool outputs for the same turn.
         if not _has_tool_after_latest_human(messages):
+            search_tool_call = _build_search_intent_tool_call(messages)
+            if search_tool_call is not None:
+                return {"messages": [search_tool_call]}
             routed_tool_call = _build_local_intent_tool_call(messages)
             if routed_tool_call is not None:
                 return {"messages": [routed_tool_call]}
@@ -940,7 +1187,22 @@ def agent_node(state: AgentState) -> AgentState:
     - Do NOT return a JSON blob in normal text like {"name": "...", "arguments": {...}}.
     - Do NOT describe a tool call. Actually perform the tool call.
     - If user asks to search jobs, call search_linkedin_jobs immediately with concrete arguments.
+    - For follow-up source filters, pass sources CSV:
+      linkedin / indeed / naukri (e.g., "linkedin,naukri").
     - After tool results are returned, summarize results clearly for the user.
+    """
+
+    aggregator_instructions = ""
+    if search_aggregator_enabled:
+        aggregator_instructions = """
+    SEARCH AGGREGATOR MODE IS ENABLED.
+    - When user asks to search jobs, call search_linkedin_jobs.
+    - The tool aggregates from multiple providers (Linked-In, Indeed, Naukri).
+    - Respect source-specific follow-ups by passing sources CSV in tool args:
+      "linkedin", "indeed", "naukri", or combinations like "linkedin,naukri".
+    - For "show me more ..." follow-ups, reuse previous search criteria unless user changes them.
+    - If tool output contains one or more *_jobs lists, present each source in separate sections.
+    - Keep the source section headers explicit, e.g., "Linked-In Jobs", "Indeed Jobs", "Naukri Jobs".
     """
 
     # System message for the agent
@@ -968,6 +1230,8 @@ def agent_node(state: AgentState) -> AgentState:
     - Help users refine their search criteria
     - Be proactive in suggesting relevant actions
     - Use the user's actual profile data for personalization
+    - If tool output includes one or more aggregator lists like *_jobs, present each source in a separate section.
+    {aggregator_instructions}
     
     When searching for jobs, consider:
     - Keywords/job titles

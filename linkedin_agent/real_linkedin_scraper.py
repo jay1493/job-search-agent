@@ -6,9 +6,10 @@ Fetches actual job data from LinkedIn using multiple methods
 import os
 import time
 import json
+import ast
 import re
 from typing import List, Dict, Optional
-from urllib.parse import quote
+from urllib.parse import quote, parse_qs, urlparse
 import requests
 from bs4 import BeautifulSoup
 
@@ -28,6 +29,7 @@ class LinkedInJobScraper:
         self.typeahead_url = "https://in.linkedin.com/jobs-guest/api/typeaheadHits"
         self.search_strategy = os.getenv("LINKEDIN_SEARCH_STRATEGY", "auto").strip().lower()
         self.session = requests.Session()
+        self.last_aggregator_debug: Dict[str, Dict] = {}
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -36,6 +38,573 @@ class LinkedInJobScraper:
             'Connection': 'keep-alive',
             'Upgrade-Insecure-Requests': '1'
         })
+
+    def _extract_exp_years_from_text(self, text: str) -> Optional[int]:
+        """Extract explicit years from user keyword text, e.g. '6 years'."""
+        if not text:
+            return None
+        m = re.search(r"\b(\d{1,2})\s*(?:\+?\s*)?(?:year|years|yr|yrs)\b", text.lower())
+        if m:
+            return int(m.group(1))
+        return None
+
+    def _normalize_naukri_location(self, location: str) -> str:
+        """Normalize location as Naukri commonly expects (e.g., 'delhi / ncr')."""
+        if not location:
+            return ""
+        loc = re.sub(r"\s+", " ", location.strip())
+        loc_lower = loc.lower()
+        if loc_lower in {"delhi ncr", "delhi-ncr", "delhi/ncr", "delhi / ncr", "ncr", "delhi ncr location"}:
+            return "delhi / ncr"
+        return loc_lower
+
+    def _normalize_serpapi_location(self, location: str) -> str:
+        """Normalize location for SerpAPI geo hint."""
+        if not location:
+            return "India"
+        loc = re.sub(r"\s+", " ", location.strip())
+        loc_lower = loc.lower()
+        if loc_lower in {"delhi ncr", "delhi-ncr", "delhi/ncr", "delhi / ncr", "ncr", "delhi ncr location"}:
+            return "Delhi, India"
+        if "," in loc:
+            return loc
+        return f"{loc}, India"
+
+    def _safe_json_response(self, response: requests.Response):
+        """Parse JSON with fallbacks for prefixed/non-strict payloads."""
+        text = response.text or ""
+
+        # 1) Strict JSON parse.
+        try:
+            return response.json()
+        except Exception:
+            pass
+
+        # 2) Strip common anti-JSON prefixes and parse object slice.
+        cleaned = text.lstrip()
+        cleaned = re.sub(r"^\)\]\}',?\s*", "", cleaned)
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            snippet = cleaned[start:end + 1]
+            try:
+                return json.loads(snippet)
+            except Exception:
+                pass
+
+            # 3) Python/JSON-ish fallback (single quotes etc.).
+            try:
+                py_like = re.sub(r"\btrue\b", "True", snippet, flags=re.IGNORECASE)
+                py_like = re.sub(r"\bfalse\b", "False", py_like, flags=re.IGNORECASE)
+                py_like = re.sub(r"\bnull\b", "None", py_like, flags=re.IGNORECASE)
+                parsed = ast.literal_eval(py_like)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+
+            # 4) As a last resort, extract jobDetails array only.
+            m = re.search(r'(?:"jobDetails"|\'jobDetails\'|jobDetails)\s*:\s*\[', snippet)
+            if m:
+                array_start = m.end() - 1
+                depth = 0
+                in_string = False
+                escaped = False
+                quote_char = ""
+                for idx in range(array_start, len(snippet)):
+                    ch = snippet[idx]
+                    if in_string:
+                        if escaped:
+                            escaped = False
+                        elif ch == "\\":
+                            escaped = True
+                        elif ch == quote_char:
+                            in_string = False
+                        continue
+                    if ch in {'"', "'"}:
+                        in_string = True
+                        quote_char = ch
+                        continue
+                    if ch == "[":
+                        depth += 1
+                    elif ch == "]":
+                        depth -= 1
+                        if depth == 0:
+                            arr_text = snippet[array_start:idx + 1]
+                            try:
+                                return {"jobDetails": json.loads(arr_text)}
+                            except Exception:
+                                try:
+                                    py_like = re.sub(r"\btrue\b", "True", arr_text, flags=re.IGNORECASE)
+                                    py_like = re.sub(r"\bfalse\b", "False", py_like, flags=re.IGNORECASE)
+                                    py_like = re.sub(r"\bnull\b", "None", py_like, flags=re.IGNORECASE)
+                                    return {"jobDetails": ast.literal_eval(py_like)}
+                                except Exception:
+                                    break
+
+        raise ValueError("Unable to parse Naukri response JSON payload.")
+
+    def _parse_indeed_jobs_html(self, html: str, limit: int) -> List[Dict]:
+        """Parse Indeed SRP HTML into normalized job objects."""
+        soup = BeautifulSoup(html, "html.parser")
+        cards = soup.find_all("li", class_=re.compile(r"css-1ac2h1w"))
+        if not cards:
+            cards = soup.find_all("div", class_=re.compile(r"\bjob_seen_beacon\b"))
+
+        jobs: List[Dict] = []
+        for card in cards:
+            if len(jobs) >= limit:
+                break
+
+            anchor = card.find("a", attrs={"data-jk": True}) or card.find("a", href=True)
+            if not anchor:
+                continue
+
+            job_jk = anchor.get("data-jk", "").strip()
+            href = anchor.get("href", "").strip()
+            if not job_jk and "/rc/clk" not in href and "/viewjob" not in href:
+                continue
+
+            title_span = anchor.find("span")
+            title = ""
+            if title_span and title_span.get_text(strip=True):
+                title = title_span.get_text(strip=True)
+            elif anchor.get("title"):
+                title = anchor.get("title").strip()
+            if not title:
+                continue
+
+            company_elem = card.find("span", attrs={"data-testid": "company-name"})
+            location_elem = card.find("div", attrs={"data-testid": "text-location"})
+            snippet_elem = card.find("div", attrs={"data-testid": "belowJobSnippet"})
+
+            company = company_elem.get_text(strip=True) if company_elem else "Unknown"
+            job_location = location_elem.get_text(strip=True) if location_elem else "Not specified"
+            snippet = snippet_elem.get_text(" ", strip=True) if snippet_elem else ""
+
+            if href.startswith("/"):
+                job_url = f"https://in.indeed.com{href}"
+            elif href.startswith("http"):
+                job_url = href
+            else:
+                job_url = f"https://in.indeed.com/{href.lstrip('/')}"
+
+            jobs.append({
+                "job_id": job_jk or href,
+                "title": title,
+                "company": company,
+                "location": job_location,
+                "description": snippet,
+                "url": job_url,
+                "posted_date": "Unknown",
+                "easy_apply": False,
+                "source": "Indeed",
+                "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+        return jobs
+
+    def _slugify_indeed_part(self, value: str) -> str:
+        """Convert free text to Indeed path-style slug."""
+        if not value:
+            return ""
+        slug = re.sub(r"[^a-zA-Z0-9\s\-]+", "", value.lower())
+        slug = re.sub(r"\s+", "-", slug).strip("-")
+        return slug
+
+    def _is_indeed_url(self, url: str) -> bool:
+        """Return True for Indeed domains only."""
+        if not url:
+            return False
+        try:
+            host = (urlparse(url).netloc or "").lower()
+        except Exception:
+            return False
+        return bool(re.search(r"(^|\.)indeed\.[a-z.]+$", host))
+
+    def _extract_indeed_job_id(self, url: str) -> str:
+        """Extract Indeed job identifier from common query params."""
+        if not url:
+            return ""
+
+        try:
+            parsed = urlparse(url)
+            query = parse_qs(parsed.query or "")
+            for key in ("jk", "vjk"):
+                values = query.get(key) or []
+                if values and values[0]:
+                    return values[0]
+        except Exception:
+            pass
+
+        match = re.search(r"(?:jk|vjk)=([a-zA-Z0-9]+)", url)
+        if match:
+            return match.group(1)
+        return url
+
+    def _search_indeed_jobs_via_serpapi(
+        self,
+        keywords: str,
+        location: str = "",
+        experience_level: str = "",
+        limit: int = 10,
+    ) -> Dict:
+        """
+        Search Indeed job URLs using SerpAPI (Google engine).
+        Returns both normalized jobs and debug metadata.
+        """
+        api_key = os.getenv("SERPAPI_API_KEY") or os.getenv("SERP_API_KEY")
+
+        if not api_key:
+            return {
+                "jobs": [],
+                "debug": {
+                    "selected_strategy": "serpapi_google_search",
+                    "api_configured": False,
+                    "query": None,
+                    "parsed_count": 0,
+                },
+            }
+
+        query_parts = [keywords.strip()]
+        if experience_level:
+            query_parts.append(experience_level.strip())
+        query_base = " ".join(part for part in query_parts if part).strip()
+        query = f"{query_base} site:(indeed.com OR in.indeed.com)".strip()
+        serp_location = self._normalize_serpapi_location(location)
+
+        jobs: List[Dict] = []
+        start_index = 0
+        page_count = 0
+        raw_item_count = 0
+
+        while len(jobs) < limit:
+            per_page = min(10, limit - len(jobs))
+            params = {
+                "engine": "google",
+                "q": query,
+                "api_key": api_key,
+                "num": per_page,
+                "start": start_index,
+                "location": serp_location,
+            }
+
+            try:
+                response = requests.get(
+                    "https://serpapi.com/search.json",
+                    params=params,
+                    timeout=15,
+                )
+                if response.status_code in {401, 403}:
+                    reason = ""
+                    try:
+                        err_payload = response.json()
+                        if isinstance(err_payload, dict):
+                            reason = str(
+                                err_payload.get("error")
+                                or err_payload.get("message")
+                                or err_payload
+                            )
+                    except Exception:
+                        reason = (response.text or "").strip()[:400]
+
+                    return {
+                        "jobs": jobs[:limit],
+                        "debug": {
+                            "selected_strategy": "serpapi_google_search",
+                            "api_configured": True,
+                            "query": query,
+                            "location": serp_location,
+                            "page_count": page_count,
+                            "raw_item_count": raw_item_count,
+                            "parsed_count": len(jobs[:limit]),
+                            "status_code": response.status_code,
+                            "error": "SerpAPI authorization failed",
+                            "serpapi_error": reason,
+                            "hint": (
+                                "Verify SERPAPI_API_KEY is valid, active, and has remaining credits."
+                            ),
+                        },
+                    }
+
+                response.raise_for_status()
+                data = response.json()
+                if isinstance(data, dict) and data.get("error"):
+                    return {
+                        "jobs": jobs[:limit],
+                        "debug": {
+                            "selected_strategy": "serpapi_google_search",
+                            "api_configured": True,
+                            "query": query,
+                            "location": serp_location,
+                            "page_count": page_count,
+                            "raw_item_count": raw_item_count,
+                            "parsed_count": len(jobs[:limit]),
+                            "error": f"SerpAPI error: {data.get('error')}",
+                        },
+                    }
+            except Exception as e:
+                return {
+                    "jobs": jobs[:limit],
+                    "debug": {
+                        "selected_strategy": "serpapi_google_search",
+                        "api_configured": True,
+                        "query": query,
+                        "location": serp_location,
+                        "page_count": page_count,
+                        "raw_item_count": raw_item_count,
+                        "parsed_count": len(jobs[:limit]),
+                        "error": str(e),
+                    },
+                }
+
+            items = data.get("organic_results", []) if isinstance(data, dict) else []
+            if not items:
+                break
+
+            page_count += 1
+            raw_item_count += len(items)
+
+            for item in items:
+                url = item.get("link", "").strip()
+                if not self._is_indeed_url(url):
+                    continue
+
+                title = (item.get("title") or "Indeed Job").strip()
+                title = re.sub(
+                    r"\s*[-|]\s*Indeed(?:\.com| India| Canada| UK)?\s*$",
+                    "",
+                    title,
+                    flags=re.IGNORECASE,
+                ).strip()
+                snippet = (item.get("snippet") or "").strip()
+                job_id = self._extract_indeed_job_id(url)
+
+                jobs.append({
+                    "job_id": job_id,
+                    "title": title or "Indeed Job",
+                    "company": "Unknown",
+                    "location": location or "Not specified",
+                    "description": snippet,
+                    "url": url,
+                    "posted_date": "Unknown",
+                    "easy_apply": False,
+                    "source": "Indeed (SerpAPI)",
+                    "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+
+                if len(jobs) >= limit:
+                    break
+
+            if len(items) < per_page:
+                break
+            start_index += per_page
+
+        return {
+            "jobs": jobs[:limit],
+            "debug": {
+                "selected_strategy": "serpapi_google_search",
+                "api_configured": True,
+                "query": query,
+                "location": serp_location,
+                "page_count": page_count,
+                "raw_item_count": raw_item_count,
+                "parsed_count": len(jobs[:limit]),
+            },
+        }
+
+    def search_indeed_jobs(
+        self,
+        keywords: str,
+        location: str = "",
+        experience_level: str = "",
+        limit: int = 10,
+        max_retries: int = 5,
+    ) -> List[Dict]:
+        """
+        Search Indeed jobs via SerpAPI and return Indeed URLs only.
+        Direct Indeed scraping is avoided due anti-bot/captcha blocks.
+        """
+        _ = max_retries  # Retained for interface compatibility.
+        if not keywords.strip():
+            self.last_aggregator_debug["indeed"] = {
+                "selected_strategy": "serpapi_google_search",
+                "api_configured": bool(os.getenv("SERPAPI_API_KEY") or os.getenv("SERP_API_KEY")),
+                "query": None,
+                "parsed_count": 0,
+                "error": "Missing keywords",
+            }
+            return []
+
+        result = self._search_indeed_jobs_via_serpapi(
+            keywords=keywords,
+            location=location,
+            experience_level=experience_level,
+            limit=limit,
+        )
+
+        debug = result.get("debug", {})
+        debug["input"] = {
+            "keywords": keywords,
+            "location": location,
+            "experience_level": experience_level,
+            "limit": limit,
+        }
+        self.last_aggregator_debug["indeed"] = debug
+        return result.get("jobs", [])
+
+    def _infer_experience_years(self, keywords: str, experience_level: str = "") -> int:
+        """Infer numeric experience years only from explicit numeric text."""
+        text = f"{keywords} {experience_level}".lower()
+        m = re.search(r"\b(\d{1,2})\s*(?:\+?\s*)?(?:year|years|yr|yrs)\b", text)
+        if m:
+            return int(m.group(1))
+        m_range = re.search(r"\b(\d{1,2})\s*(?:-|to)\s*(\d{1,2})\b", text)
+        if m_range:
+            return int(m_range.group(1))
+        m_plain = re.search(r"\b(\d{1,2})\b", (experience_level or "").strip())
+        if m_plain:
+            return int(m_plain.group(1))
+        return 0
+
+    def search_naukri_jobs(
+        self,
+        keywords: str,
+        location: str = "",
+        experience_level: str = "",
+        limit: int = 10,
+    ) -> List[Dict]:
+        """
+        Search jobs from Naukri SRP API.
+        Supports page-based pagination via pageNo.
+        """
+        base_url = "https://www.naukri.com/jobapi/v3/search"
+        jobs: List[Dict] = []
+        page_no = 1
+
+        debug = {
+            "input": {
+                "keywords": keywords,
+                "location": location,
+                "normalized_location": self._normalize_naukri_location(location),
+                "experience_level": experience_level,
+            },
+            "pages": [],
+        }
+
+        max_pages = max(1, ((limit - 1) // 20) + 1)
+        normalized_location = self._normalize_naukri_location(location)
+        normalized_keywords = re.sub(r"\s+", " ", (keywords or "").strip()).lower()
+
+        while len(jobs) < limit and page_no <= max_pages:
+            params = {
+                "noOfResults": 20,
+                "urlType": "search_by_key_loc",
+                "searchType": "adv",
+                "location": normalized_location or location,
+                "keyword": normalized_keywords or keywords,
+                "pageNo": page_no,
+                "k": normalized_keywords or keywords,
+                "l": normalized_location or location,
+                "src": "directSearch",
+            }
+            experience_years = self._infer_experience_years(keywords, experience_level)
+            if experience_years > 0:
+                # Keep duplicate experience param as observed in provided curl.
+                params["experience"] = [str(experience_years), str(experience_years)]
+
+            headers = {
+                "appid": "109",
+                "systemid": "Naukri",
+            }
+
+            try:
+                # Keep request structure aligned with known-good curl shape.
+                response = requests.get(base_url, params=params, headers=headers, timeout=15)
+                response.raise_for_status()
+                data = self._safe_json_response(response)
+                debug["pages"].append({
+                    "pageNo": page_no,
+                    "status_code": response.status_code,
+                    "content_type": response.headers.get("Content-Type", ""),
+                    "params": {
+                        "keyword": params["keyword"],
+                        "location": params["location"],
+                        "pageNo": params["pageNo"],
+                        "experience": params.get("experience"),
+                    },
+                })
+            except Exception as e:
+                print(f"Naukri request failed on page {page_no}: {e}")
+                debug["pages"].append({
+                    "pageNo": page_no,
+                    "error": str(e),
+                    "params": {
+                        "keyword": params["keyword"],
+                        "location": params["location"],
+                        "pageNo": params["pageNo"],
+                        "experience": params.get("experience"),
+                    },
+                })
+                break
+
+            if not isinstance(data, dict):
+                debug["pages"].append({
+                    "pageNo": page_no,
+                    "error": "Naukri response was not an object",
+                })
+                break
+
+            details = data.get("jobDetails", [])
+            if not isinstance(details, list) or not details:
+                break
+
+            for item in details:
+                if len(jobs) >= limit:
+                    break
+                if not isinstance(item, dict):
+                    continue
+
+                job_id = str(item.get("jobId", "")).strip()
+                title = item.get("title", "Unknown")
+                company = item.get("companyName", "Unknown")
+
+                placeholders = item.get("placeholders", [])
+                location_value = "Not specified"
+                if isinstance(placeholders, list):
+                    for ph in placeholders:
+                        if isinstance(ph, dict) and ph.get("type") == "location":
+                            location_value = ph.get("label", location_value)
+                            break
+
+                jd_url = item.get("jdURL", "")
+                if isinstance(jd_url, str) and jd_url:
+                    url = f"https://www.naukri.com{jd_url}" if jd_url.startswith("/") else jd_url
+                else:
+                    url = f"https://www.naukri.com/{job_id}" if job_id else "https://www.naukri.com"
+
+                raw_description = item.get("jobDescription", "")
+                description = BeautifulSoup(str(raw_description), "html.parser").get_text(" ", strip=True)
+
+                jobs.append({
+                    "job_id": job_id or url,
+                    "title": title,
+                    "company": company,
+                    "location": location_value,
+                    "description": description,
+                    "url": url,
+                    "posted_date": item.get("footerPlaceholderLabel", "Unknown"),
+                    "easy_apply": False,
+                    "source": "Naukri",
+                    "scraped_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+
+            page_no += 1
+            time.sleep(0.5)
+
+        debug["parsed_count"] = len(jobs[:limit])
+        self.last_aggregator_debug["naukri"] = debug
+        return jobs[:limit]
 
     def _normalize_india_location(self, location: str) -> str:
         """Append ', India' when location is provided without country suffix."""
