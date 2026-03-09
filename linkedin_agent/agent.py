@@ -1146,7 +1146,7 @@ def agent_node(state: AgentState) -> AgentState:
 
     # Deterministic post-tool summary for all providers to keep output stable
     # and ensure aggregator sections are properly separated.
-    if llm_provider == "ollama" and messages and isinstance(messages[-1], ToolMessage):
+    if messages and isinstance(messages[-1], ToolMessage):
         deterministic_summary = _build_tool_summary_from_latest_tool(messages)
         if deterministic_summary:
             return {"messages": [AIMessage(content=deterministic_summary)]}
