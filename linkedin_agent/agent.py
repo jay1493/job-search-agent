@@ -449,24 +449,29 @@ def _build_tool_summary_from_latest_tool(messages: list) -> Optional[str]:
                     company = job.get("company", "Unknown company")
                     location = job.get("location", "Unknown location")
                     raw_id = str(job.get("job_id", ""))
+                    url = str(job.get("url", "")).strip()
                     if source == "indeed":
                         description = str(job.get("description", "")).strip()
                         if len(description) > 240:
                             description = f"{description[:237]}..."
-                        url = str(job.get("url", "")).strip() or "Not available"
                         id_value = raw_id
                         lines.append(f"{i}. {title} [{source}_id: {id_value}]")
                         if description:
                             lines.append(f"   Description: {description}")
-                        lines.append(f"   URL: {url}")
+                        if url:
+                            lines.append(f"   View Job: [View Job]({url})")
                     elif source == "linkedin":
                         id_value = _extract_numeric_job_id(raw_id) or raw_id
                         id_label = "job_id"
                         lines.append(f"{i}. {title} at {company} ({location}) [{id_label}: {id_value}]")
+                        if url:
+                            lines.append(f"   View Job: [View Job]({url})")
                     else:
                         id_value = raw_id
                         id_label = f"{source}_id"
                         lines.append(f"{i}. {title} at {company} ({location}) [{id_label}: {id_value}]")
+                        if url:
+                            lines.append(f"   View Job: [View Job]({url})")
                 lines.append("")
         else:
             count = payload.get("count", len(jobs))
@@ -478,7 +483,10 @@ def _build_tool_summary_from_latest_tool(messages: list) -> Optional[str]:
                 location = job.get("location", "Unknown location")
                 raw_id = str(job.get("job_id", ""))
                 numeric_id = _extract_numeric_job_id(raw_id) or raw_id
+                url = str(job.get("url", "")).strip()
                 lines.append(f"{i}. {title} at {company} ({location}) [job_id: {numeric_id}]")
+                if url:
+                    lines.append(f"   View Job: [View Job]({url})")
             lines.append("")
 
         lines.append("You can ask:")
@@ -1221,6 +1229,8 @@ def agent_node(state: AgentState) -> AgentState:
     - Provide clear summaries of job matches
     - Help users refine their search criteria
     - Be proactive in suggesting relevant actions
+    - For each listed job, include a line in markdown format:
+      View Job: [View Job](job_url) whenever job_url is available
     - Keep suggestions limited to:
       - Get job details
       - Show more jobs
